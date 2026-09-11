@@ -1,115 +1,177 @@
-# ASG Airlines — End-to-End Data Engineering Case Study
+# ASG Airlines — End-to-End Data Engineering Pipeline
 
-Case study by **Yamini D**. I built a full pipeline that takes messy raw flight, booking, passenger, and payment data and turns it into a clean, analytics-ready dataset with a Power BI dashboard on top.
+An end-to-end data pipeline built for the ASG Airlines case study: raw flight, booking, passenger, and payment data is ingested from a single multi-sheet Excel source and pushed through a **Bronze → Silver → Gold** architecture, with a **quarantine table** for anything that fails validation (nothing is silently dropped) and **PII hashing** for passenger data before it reaches the reporting layer.
 
-## Problem I was solving
+Built and run on **Databricks** (notebook is portable to any local Python environment — see [Running Locally](#running-locally-outside-databricks) below).
 
-ASG Airlines collects flight data from its booking platform, scheduling system, and airport logs. The raw data has corrupted flight IDs, inconsistent time formats, missing values, and overnight flights where the arrival date rolls into the next day. I built a pipeline that ingests this data, validates and cleans it, protects passenger PII, and produces a reliable dataset for reporting.
+---
+
+## Table of Contents
+
+- [Problem Statement](#problem-statement)
+- [Architecture](#architecture)
+- [Repository Structure](#repository-structure)
+- [Dataset](#dataset)
+- [Pipeline Walkthrough](#pipeline-walkthrough)
+- [Data Quality & PII Handling](#data-quality--pii-handling)
+- [KPIs](#kpis)
+- [Running Locally (outside Databricks)](#running-locally-outside-databricks)
+- [Dashboard](#dashboard)
+- [Tech Stack](#tech-stack)
+- [Documentation](#documentation)
+
+---
+
+## Problem Statement
+
+ASG Airlines collects operational flight data from three separate systems — a booking platform, a scheduling system, and airport logs. The raw data has real, intentional quality issues: corrupted flight identifiers, inconsistent timestamps, missing values, and unhandled overnight (cross-day) flights. This pipeline ingests, validates, cleans, and models that data into an analytics-ready star schema, while protecting passenger PII, so it can support accurate reporting on flight duration, route traffic, delays/anomalies, and airline distribution.
 
 ## Architecture
 
-I used a **Bronze → Silver → Gold** structure, with a separate quarantine layer for anything that fails validation:
-
 ```
-Raw Excel (flights, bookings, passengers, payments)
+SOURCE (Excel: flights, bookings, passengers, payments)
         │
         ▼
-    BRONZE  — raw data, loaded as-is
+BRONZE   — raw, as-is, full PII, restricted access
+        │
+        ▼   validation checks run here
+        ├── fails a check ──► QUARANTINE (row + error_code + error_reason + pipeline_run_id)
+        └── passes ─────────►
+SILVER   — deduplicated, standardized, duration recomputed from timestamps,
+           overnight/anomaly flags applied, referential integrity enforced
+           PII HASHED (SHA-256 + salt) here — raw PII does not exist past this point
         │
         ▼
-  VALIDATE  — schema checks, missing values, format rules
+GOLD     — star schema (dim_airline, dim_route, dim_date, dim_passenger,
+           fact_flights, fact_bookings, fact_payments) + data_quality_metrics
         │
-   ┌────┴────┐
-   ▼         ▼
- SILVER   QUARANTINE  — invalid rows tagged with a reason code, not deleted
-   │
-   ▼
-PII MASKING — Aadhaar, phone, email split into a restricted vault
-   │
-   ▼
-  GOLD  — star schema (dim + fact tables), ready for Power BI
+        ▼
+POWER BI — reads Gold-layer CSVs only
 ```
 
-I quarantine instead of delete because a real airline can't afford to silently lose records — every rejected row is tagged with an `error_reason` and a `pipeline_run_id` so it can be traced and reprocessed later.
+**Why quarantine instead of deleting:** every row that fails a check is preserved with a reason code and the pipeline run that caught it, so it's reprocessable rather than silently lost.
 
-## Repo structure
+**Why PII is masked at the Bronze→Silver boundary, not in a parallel branch:** this way raw PII physically stops existing past Bronze — a stronger privacy guarantee than keeping an untouched copy alongside the cleaned data.
+
+## Repository Structure
 
 ```
-├── notebook/
-│   └── ASG_Airlines.ipynb          # full pipeline: ingestion → cleaning → gold layer
+ASG-airlines-data-pipeline/
+├── README.md
+├── requirements.txt
+├── .gitignore
 ├── data/
-│   ├── UseCase - Airlines.xlsx     # raw source file (bronze)
-│   ├── cleaned/                    # gold layer: dim/fact CSVs, ready for Power BI
-│   ├── quarantine/                 # rejected rows with reason codes
-│   └── pii_vault/                  # restricted — raw PII, not for general access
-├── dashboard/
-│   └── ASG_Airlines_Dashboard.pbix
-└── docs/
-    └── ASG_Airlines_Case_Study.docx  # full write-up: assumptions, logic, KPIs
+│   └── raw/
+│       └── UseCase_-_Airlines.xlsx     ← original source file (4 sheets)
+├── notebooks/
+│   └── ASG_Airlines.ipynb              ← the full pipeline, markdown-annotated
+├── docs/
+│   ├── ASG_Airlines_Yamini.D.docx       ← architecture, assumptions, data model, cleaning logic
+│   └── images/
+│       ├── dashboard_overview.png
+│       ├── dashboard_bookings.png
+│       └── dashboard_airlines.png
+└── powerbi/
+    └── ASG_Airlines Dashboard.pbix
 ```
 
-## How to run the notebook
+> Pipeline outputs (`data/cleaned/`, `data/pii_vault/`, `data/quarantine/`) are generated by running the notebook and are gitignored rather than committed — they're regenerated on every run, not source data.
 
-1. Clone the repo.
-2. Make sure `data/UseCase - Airlines.xlsx` is present (already included here).
-3. Open `notebook/ASG_Airlines.ipynb` in Jupyter, VS Code, or Databricks.
-4. Run all cells top to bottom. It writes the gold CSVs to `data/cleaned/`.
+## Dataset
 
-This was originally built and run on Databricks Community Edition. I've since made all paths relative so it runs the same way locally — no cloud account needed.
+The source file is a 4-sheet Excel workbook, not a flat CSV:
 
-## What the pipeline actually does
+| Sheet | Contents |
+|---|---|
+| `flights` | flight_id, airline, source, destination, departure_time, arrival_time, duration |
+| `bookings` | booking_id, passenger_id, flight_id, status |
+| `passengers` | passenger_id, name, age, gender, email, phone, aadhaar_id, date_of_birth |
+| `payments` | payment_id, booking_id, amount, payment_method |
 
-**Cleaning & validation** — I standardized text fields (airline names, city codes), fixed data types (`aadhaar_id` was silently read as `int64`, which truncates leading zeros — I forced it to string), parsed inconsistent time formats, and removed exact duplicate rows.
+Referential integrity across sheets is checked, not assumed — every `booking.flight_id` is validated against `flights`, and every `payment.booking_id` against `bookings`.
 
-**Overnight flight handling** — if arrival time is earlier than departure time and the gap is 12 hours or less, I treat it as a next-day arrival and add a day to it. Anything that still doesn't make sense after that gets quarantined rather than guessed at.
+## Pipeline Walkthrough
 
-**Surrogate key fix** — `flight_id` values repeat across genuinely different flights (same route number flown on different days), so I generated a composite `flight_key` (`flight_id` + `departure_time`) to uniquely identify each flight before joining bookings to flights.
+The notebook is organized into clearly labeled, markdown-annotated sections:
 
-**PII masking** — Aadhaar ID, phone, and email are hashed (SHA-256) for the analytical layer, and the raw values live only in a separate `pii_vault` table that's excluded from the Power BI-facing gold layer entirely. Only the vault, not just a hash, should sit behind restricted access.
+1. **Setup & ingestion** — load all four sheets from the Excel source
+2. **Profiling** — null counts and duplicate rows per table, logged before any changes are made
+3. **Type correction** — `amount` coerced to numeric, `aadhaar_id` to string, `status` standardized
+4. **Quarantine framework** — a reusable function that tags and sets aside bad rows instead of dropping them
+5. **Flight validation** — timestamp parsing, flight_id format checks, overnight-flight handling (arrival date rolled forward when the gap is under 12 hours), `is_overnight` flag
+6. **Booking validation** — referential integrity against `flights`, plus a logical-impossibility check (a booking made after its flight already departed)
+7. **Payment validation** — referential integrity against `bookings`, and zero/negative/missing amounts flagged separately from each other
+8. **Silver layer** — Aadhaar format validation (must be a valid 12-digit number), duplicate `passenger_id` handling, a `flight_key` surrogate key since raw `flight_id` is reused across different routes
+9. **PII masking** — SHA-256 + salt hashing of passenger PII, isolated into a separate restricted vault table
+10. **Gold layer** — star schema build: dimension and fact tables
+11. **KPI calculation** — computed once in the pipeline, not recalculated per Power BI filter
+12. **Data quality metrics** — valid-record rate and field completeness logged per table, per run
+13. **Export** — Gold tables, PII vault, and the quarantine table written out as CSV
 
-**Data quality scoring** — each source table gets a measurable `valid_record_rate` and `field_completeness` score per pipeline run, so the pipeline reports on its own reliability instead of just producing output silently.
+## Data Quality & PII Handling
 
-## Results after cleaning
+- **Quarantine, not deletion.** Every rejected row keeps its original data plus `source_table`, `error_code`, `error_reason`, and `pipeline_run_id`, so it can be reprocessed later.
+- **PII protection.** `aadhaar_id`, `email`, `phone`, and other sensitive passenger fields are SHA-256 hashed with a project salt before reaching the Gold layer. The identifiable vault table is kept physically separate and treated as restricted.
+- **Ambiguity called out explicitly, not hidden:** `flight_id` is not a reliable primary key on its own (it's reused across different routes), so a `flight_key` surrogate is introduced. Because `bookings` only carries `flight_id` (not a timestamp), a booking against a reused `flight_id` can't always be pinned to one exact flight — this is documented rather than silently resolved.
 
-| Table | Raw rows | Quarantined | Clean rows |
-|---|---|---|---|
-| Flights | 1,020 | 16 | 1,004 |
-| Bookings | 1,000 | 3 | 997 |
-| Passengers | 1,039 | 144 | 895 |
-| Payments | 1,000 | 78 | 922 |
+## KPIs
 
-**241 rows** were quarantined in total, each with a specific reason code (invalid Aadhaar format, duplicate passenger ID, missing/negative payment amount, unmatched booking, etc.) — nothing was dropped without a traceable reason.
+- Average flight duration
+- Route-wise traffic
+- Anomaly rate (duration-based outlier detection per route)
+- Flight distribution by airline
+- Revenue by route
+- Data quality score (valid-record rate, field completeness) per table, per pipeline run
 
-## Key business KPIs
+## Running Locally (outside Databricks)
 
-- **Average flight duration:** 164.5 minutes
-- **Busiest route:** BOM–CCU (90 flights), followed by CCU–DEL (72) and MAA–BLR (65)
-- **Flights by airline:** IndiGo (249), SpiceJet (235), Air India (233), Vistara (218)
-- **Anomaly rate:** 0.1% of flights, flagged using per-route statistical thresholds (mean ± 2 standard deviations) rather than one fixed cutoff for every route
-- **Highest revenue route:** BOM–CCU (₹7,00,135)
+The pipeline is plain **pandas** — no Spark — so it runs anywhere Python does. The only Databricks-specific pieces are two magic commands and the input/output file paths (Databricks Unity Catalog `/Volumes/...` paths). To run it locally or on another platform (Colab, plain Jupyter, etc.):
 
-Full KPI breakdown and the reasoning behind each transformation decision is in `docs/ASG_Airlines_Case_Study.docx`.
+**Remove these cells:**
+- `%pip install openpyxl` — this is a Databricks notebook magic; install dependencies from `requirements.txt` in your terminal instead
+- `%restart_python` — Databricks-only; not valid outside Databricks and safe to delete
 
-## Power BI dashboard
+**Change these paths:**
 
-The `.pbix` connects directly to the gold CSVs in `data/cleaned/` as a star schema:
+| Variable | Databricks (current) | Local (change to) |
+|---|---|---|
+| `FILE_PATH` | `/Volumes/workspace/default/airline_data/UseCase - Airlines.xlsx` | `data/raw/UseCase_-_Airlines.xlsx` |
+| `GOLD_PATH` | `/Volumes/workspace/default/airline_data/cleaned` | `data/cleaned` |
+| `VAULT_PATH` | `/Volumes/workspace/default/airline_data/pii_vault` | `data/pii_vault` |
+| `QUARANTINE_PATH` | `/Volumes/workspace/default/airline_data/quarantine` | `data/quarantine` |
 
-- **Dimensions:** `dim_airline`, `dim_route`, `dim_date`, `dim_passenger`
-- **Facts:** `fact_flights`, `fact_bookings`, `fact_payments`
-- **Relationships:** each fact table joins to its dimensions on the `*_key` columns (one-to-many, dim → fact)
+**Add this (local setup, once):**
+```bash
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+jupyter notebook notebooks/ASG_Airlines.ipynb
+```
 
-**Dashboard pages:**
-1. **Duration Analysis** — average/median duration, duration distribution, duration by airline
-2. **Route Performance** — route-wise traffic, revenue by route, route map
-3. **Airline Trends** — flight share by airline, on-time patterns by airline
-4. **Delay & Anomaly Insights** — flagged anomalies by route, data quality scorecard
+Everything else in the notebook — profiling, validation, quarantine logic, Silver transformations, PII hashing, Gold star-schema build, KPI calculation — runs identically outside Databricks, since none of it depends on Spark or the Databricks runtime.
 
-Each page has slicers for airline, route, and date so the view can be filtered interactively. To open it: launch Power BI Desktop, open the `.pbix`, and if prompted, repoint the data source to your local `data/cleaned/` folder path.
+## Dashboard
 
-## Privacy note
+The Power BI dashboard is built across three report pages, all connected to the Gold-layer CSVs.
 
-The `pii_vault/` folder contains hashed-but-sensitive fields and is included here only for pipeline completeness. In a real deployment, this folder would sit in a separate, access-controlled storage location — not in a public repo — and only specific authorized roles would be able to query it.
+**Flight Overview** — KPI cards for total flights, average duration, overnight flights, total routes, total passengers, and total revenue, plus a breakdown of first source/destination by airline, average duration by route, and the overnight vs. non-overnight split.
 
-## Tech stack
+![Flight overview](docs/images/dashboard_overview.png)
 
-Python (pandas), Jupyter/Databricks notebook, Power BI Desktop, GitHub.
+**Bookings & Data Quality** — booking counts by status, a live view of quarantined records with their error codes and reasons, and total flights by source route.
+
+![Bookings and data quality](docs/images/dashboard_bookings.png)
+
+**Airline Performance** — total flights and revenue by airline, and flight volume by year.
+
+![Airline performance](docs/images/dashboard_airlines.png)
+
+*(These are static previews — for the full interactive dashboard with working filters and slicers, open `powerbi/ASG_Airlines Dashboard.pbix` in Power BI Desktop.)*
+
+## Tech Stack
+
+`Python` · `pandas` · `NumPy` · `Databricks` · `Power BI`
+
+## Documentation
+
+Full write-up — architecture diagram, data flow diagram, data model, assumptions, and the complete cleaning/transformation rationale — is in [`docs/ASG_Airlines_Yamini.D.docx`](docs/ASG_Airlines_Yamini.D.docx).
