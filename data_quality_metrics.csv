@@ -1,0 +1,5 @@
+table,run_id,valid_record_rate,field_completeness
+flights,20260911_062604,98.43,100.0
+bookings,20260911_062604,99.7,99.1
+passengers,20260911_062604,86.14,99.81
+payments,20260911_062604,92.2,98.05
